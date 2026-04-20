@@ -1,0 +1,1 @@
+web: gunicorn disco_otp_bot_full:app
