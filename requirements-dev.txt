@@ -1,0 +1,7 @@
+# Development dependencies for Discooptbot
+
+pytest
+pytest-cov
+pylint
+flake8
+bandit
